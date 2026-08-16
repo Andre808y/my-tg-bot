@@ -1,8 +1,19 @@
 import os
 import re
 import csv
+import json
+import asyncio
 from pathlib import Path
 from collections import defaultdict
+from http import HTTPStatus
+
+import uvicorn
+from starlette.applications import Starlette
+from starlette.requests import Request
+from starlette.responses import JSONResponse, Response
+from starlette.routing import Route
+from starlette.middleware import Middleware
+from starlette.middleware.cors import CORSMiddleware
 
 from telegram import (
     InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo,
@@ -19,8 +30,12 @@ GAME_URL = "https://andre808y.github.io/Iphone-jumper/"
 SELLER_CHAT_ID = int(os.environ["SELLER_CHAT_ID"])
 PORT = int(os.environ.get("PORT", 10000))
 HOSTNAME = os.environ["RENDER_EXTERNAL_HOSTNAME"]
+WEBHOOK_URL = f"https://{HOSTNAME}/{TOKEN}"
 
 PRODUCTS_FILE = Path(__file__).parent / "products.csv"
+LEADERBOARD_FILE = Path(__file__).parent / "leaderboard.json"
+LEADERBOARD_MAX_STORE = 100
+LEADERBOARD_MAX_RETURN = 20
 
 BTN_CATALOG = "📂 Каталог по категориям"
 BTN_PRICE = "🔍 Найти по названию"
@@ -33,7 +48,6 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
     resize_keyboard=True,
 )
 
-# порядок категорий в меню — от самых спрашиваемых к нишевым
 CATEGORY_ORDER = [
     "📱 iPhone", "📱 Samsung", "📱 Xiaomi / Poco", "📱 iPad", "💻 MacBook",
     "⌚️ Часы", "🎧 Наушники", "🔌 Чехлы и аксессуары", "🎮 Приставки",
@@ -106,8 +120,33 @@ def base_name(title: str) -> str:
     return re.split(r"\s+-\s+", title)[0].strip()
 
 
+PHONE_CATEGORIES = {"📱 iPhone", "📱 Samsung", "📱 Xiaomi / Poco"}
+_TIER_KEYWORDS = (
+    ("ultra", 0), ("pro max", 1), ("max", 1), ("pro", 2), ("plus", 3), ("e", 5),
+)
+
+
+def _phone_sort_key(name: str):
+    name_l = name.lower()
+    nums = re.findall(r"\d+", name)
+    num = int(nums[0]) if nums else -1
+    if num == -1 and "air" in name_l:
+        num = 17
+    tier = 4
+    for kw, val in _TIER_KEYWORDS:
+        if kw in name_l:
+            tier = val
+            break
+    return (-num, tier, name)
+
+
+def sort_models(category: str, model_names) -> list[str]:
+    if category in PHONE_CATEGORIES:
+        return sorted(model_names, key=_phone_sort_key)
+    return sorted(model_names)
+
+
 def load_catalog():
-    """Возвращает {категория: {модель: [{"name":.., "price":..}, ...]}}"""
     rows = _read_rows()
     parent_category = {}
     for r in rows:
@@ -151,6 +190,38 @@ def search_products(query: str) -> list[dict]:
     return results
 
 
+# ---------- таблица лидеров ----------
+
+def load_leaderboard() -> list[dict]:
+    if not LEADERBOARD_FILE.exists():
+        return []
+    try:
+        with open(LEADERBOARD_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return []
+
+
+def save_leaderboard(entries: list[dict]) -> None:
+    with open(LEADERBOARD_FILE, "w", encoding="utf-8") as f:
+        json.dump(entries, f, ensure_ascii=False)
+
+
+def add_score(name: str, score: int) -> list[dict]:
+    entries = load_leaderboard()
+    name = (name or "Игрок").strip()[:32] or "Игрок"
+    existing = next((e for e in entries if e["name"] == name), None)
+    if existing:
+        if score > existing["score"]:
+            existing["score"] = score
+    else:
+        entries.append({"name": name, "score": score})
+    entries.sort(key=lambda e: e["score"], reverse=True)
+    entries = entries[:LEADERBOARD_MAX_STORE]
+    save_leaderboard(entries)
+    return entries
+
+
 # ---------- меню каталога (инлайн-кнопки) ----------
 
 async def show_categories(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -183,7 +254,7 @@ async def show_models(update: Update, context: ContextTypes.DEFAULT_TYPE, cat_id
     ordered = context.chat_data.get("cat_order") or list(catalog.keys())
     cat = ordered[cat_idx]
     models = catalog[cat]
-    model_names = sorted(models.keys())
+    model_names = sort_models(cat, models.keys())
 
     context.chat_data["cur_cat"] = cat
     context.chat_data["cur_models"] = model_names
@@ -196,7 +267,7 @@ async def show_models(update: Update, context: ContextTypes.DEFAULT_TYPE, cat_id
         if len(items) == 1:
             label = f"{model} — {format_price(items[0]['price'])} ₽"
         row.append(InlineKeyboardButton(label, callback_data=f"model|{i}"))
-        if len(row) == 1:  # длинные названия — по одной кнопке в ряд
+        if len(row) == 1:
             buttons.append(row)
             row = []
     if row:
@@ -217,7 +288,6 @@ async def show_variants(update: Update, context: ContextTypes.DEFAULT_TYPE, mode
 
     lines = [f"*{model}*"]
     for p in items:
-        # убираем название модели из начала строки варианта, оставляем только "хвост"
         tail = p["name"][len(model):].lstrip(" -")
         label = tail if tail else p["name"]
         lines.append(f"• {label} — {format_price(p['price'])} ₽")
@@ -325,25 +395,81 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await update.message.reply_text("Выберите, что нужно:", reply_markup=MAIN_KEYBOARD)
 
 
-def main() -> None:
-    app = Application.builder().token(TOKEN).build()
+# ---------- веб-сервер (Telegram webhook + API таблицы лидеров) ----------
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("game", send_game))
-    app.add_handler(MessageHandler(filters.Regex(f"^{BTN_CATALOG}$"), show_categories))
-    app.add_handler(MessageHandler(filters.Regex(f"^{BTN_GAME}$"), send_game))
-    app.add_handler(MessageHandler(filters.Regex(f"^{BTN_PRICE}$"), ask_price))
-    app.add_handler(MessageHandler(filters.Regex(f"^{BTN_CONTACT}$"), ask_contact))
-    app.add_handler(CallbackQueryHandler(catalog_callback))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+application: Application = None
 
-    app.run_webhook(
-        listen="0.0.0.0",
-        port=PORT,
-        url_path=TOKEN,
-        webhook_url=f"https://{HOSTNAME}/{TOKEN}",
+
+async def telegram_webhook_route(request: Request) -> Response:
+    data = await request.json()
+    await application.update_queue.put(Update.de_json(data=data, bot=application.bot))
+    return Response()
+
+
+async def get_leaderboard_route(request: Request) -> JSONResponse:
+    return JSONResponse(load_leaderboard()[:LEADERBOARD_MAX_RETURN])
+
+
+async def post_leaderboard_route(request: Request) -> JSONResponse:
+    try:
+        data = await request.json()
+        name = str(data.get("name", "Игрок"))[:32]
+        score = int(data.get("score", 0))
+    except Exception:
+        return JSONResponse({"error": "bad request"}, status_code=HTTPStatus.BAD_REQUEST)
+    if score < 0 or score > 100000:
+        return JSONResponse({"error": "invalid score"}, status_code=HTTPStatus.BAD_REQUEST)
+    entries = add_score(name, score)
+    return JSONResponse(entries[:LEADERBOARD_MAX_RETURN])
+
+
+async def health_route(request: Request) -> Response:
+    return Response(content="ok")
+
+
+async def main() -> None:
+    global application
+    application = Application.builder().token(TOKEN).updater(None).build()
+
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("game", send_game))
+    application.add_handler(MessageHandler(filters.Regex(f"^{BTN_CATALOG}$"), show_categories))
+    application.add_handler(MessageHandler(filters.Regex(f"^{BTN_GAME}$"), send_game))
+    application.add_handler(MessageHandler(filters.Regex(f"^{BTN_PRICE}$"), ask_price))
+    application.add_handler(MessageHandler(filters.Regex(f"^{BTN_CONTACT}$"), ask_contact))
+    application.add_handler(CallbackQueryHandler(catalog_callback))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+
+    await application.bot.set_webhook(url=WEBHOOK_URL, allowed_updates=Update.ALL_TYPES)
+
+    starlette_app = Starlette(
+        routes=[
+            Route(f"/{TOKEN}", telegram_webhook_route, methods=["POST"]),
+            Route("/leaderboard", get_leaderboard_route, methods=["GET"]),
+            Route("/leaderboard", post_leaderboard_route, methods=["POST"]),
+            Route("/healthcheck", health_route, methods=["GET"]),
+        ],
+        middleware=[
+            Middleware(
+                CORSMiddleware,
+                allow_origins=["*"],
+                allow_methods=["GET", "POST", "OPTIONS"],
+                allow_headers=["*"],
+            )
+        ],
     )
+
+    webserver = uvicorn.Server(
+        config=uvicorn.Config(
+            app=starlette_app, port=PORT, host="0.0.0.0", use_colors=False
+        )
+    )
+
+    async with application:
+        await application.start()
+        await webserver.serve()
+        await application.stop()
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
