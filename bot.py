@@ -27,6 +27,7 @@ from telegram.ext import (
 # ---------- настройки ----------
 TOKEN = os.environ["BOT_TOKEN"]
 GAME_URL = "https://andre808y.github.io/Iphone-jumper/"
+SCRATCH_URL = "https://andre808y.github.io/scratch-card-frontend/"
 SELLER_CHAT_ID = int(os.environ["SELLER_CHAT_ID"])
 PORT = int(os.environ.get("PORT", 10000))
 HOSTNAME = os.environ["RENDER_EXTERNAL_HOSTNAME"]
@@ -40,11 +41,13 @@ LEADERBOARD_MAX_RETURN = 20
 BTN_CATALOG = "📂 Каталог по категориям"
 BTN_PRICE = "🔍 Найти по названию"
 BTN_GAME = "🎮 Играть"
+BTN_SCRATCH = "🎫 Скретч-карта"
 BTN_CONTACT = "💬 Связаться с продавцом"
 
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     [[KeyboardButton(BTN_CATALOG)], [KeyboardButton(BTN_PRICE)],
-     [KeyboardButton(BTN_GAME)], [KeyboardButton(BTN_CONTACT)]],
+     [KeyboardButton(BTN_GAME)], [KeyboardButton(BTN_SCRATCH)],
+     [KeyboardButton(BTN_CONTACT)]],
     resize_keyboard=True,
 )
 
@@ -346,6 +349,17 @@ async def send_game(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+async def send_scratch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    keyboard = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("🎫 Стереть карту", web_app=WebAppInfo(url=SCRATCH_URL))]]
+    )
+    await update.message.reply_text(
+        "Сотри слой пальцем — вдруг там промокод на скидку! 🎁\n"
+        "Одна попытка раз в 24 часа.",
+        reply_markup=keyboard,
+    )
+
+
 async def ask_price(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data["awaiting"] = "price"
     await update.message.reply_text(
@@ -435,6 +449,7 @@ async def main() -> None:
     application.add_handler(CommandHandler("game", send_game))
     application.add_handler(MessageHandler(filters.Regex(f"^{BTN_CATALOG}$"), show_categories))
     application.add_handler(MessageHandler(filters.Regex(f"^{BTN_GAME}$"), send_game))
+    application.add_handler(MessageHandler(filters.Regex(f"^{BTN_SCRATCH}$"), send_scratch))
     application.add_handler(MessageHandler(filters.Regex(f"^{BTN_PRICE}$"), ask_price))
     application.add_handler(MessageHandler(filters.Regex(f"^{BTN_CONTACT}$"), ask_contact))
     application.add_handler(CallbackQueryHandler(catalog_callback))
